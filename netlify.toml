@@ -1,0 +1,12 @@
+# Optional: the same repo also deploys to Netlify (adds your own matchmaking + TURN config via functions).
+[build]
+  command = "pip install -r requirements.txt && npm run build"
+  publish = "dist"
+
+[build.environment]
+  PYTHON_VERSION = "3.12"
+  NODE_VERSION = "20"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"

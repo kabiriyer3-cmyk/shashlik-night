@@ -1,0 +1,16 @@
+{
+  "name": "shashlik-night",
+  "private": true,
+  "type": "module",
+  "description": "Шашлычная ночь: first-person co-op grill game (three.js). Models are generated in Python.",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:fast": "node scripts/build.mjs --skip-models"
+  },
+  "dependencies": {
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.2"
+  }
+}

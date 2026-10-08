@@ -1,0 +1,6 @@
+node_modules/
+build/
+dist/
+src/.main.gen.js
+__pycache__/
+.netlify/

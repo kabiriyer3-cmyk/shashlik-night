@@ -1,0 +1,16 @@
+{
+  "_comment": "Скопируй в public/ice.json и впиши свой TURN (например, бесплатный Metered: metered.ca → TURN Server → Credentials). Внимание: на GitHub Pages этот файл виден всем.",
+  "iceServers": [
+    { "urls": ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] },
+    {
+      "urls": [
+        "turn:global.relay.metered.ca:80",
+        "turn:global.relay.metered.ca:80?transport=tcp",
+        "turn:global.relay.metered.ca:443",
+        "turns:global.relay.metered.ca:443?transport=tcp"
+      ],
+      "username": "ТВОЙ_USERNAME",
+      "credential": "ТВОЙ_PASSWORD"
+    }
+  ]
+}
