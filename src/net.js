@@ -17,8 +17,11 @@ export const MAX_PLAYERS = 4;
 const DEFAULT_ICE = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
   { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+  { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478', 'turn:eu-0.turn.peerjs.com:3478?transport=tcp'], username: 'peerjs', credential: 'peerjsp' },
 ];
+// what an SDP carries: host/srflx/relay candidate counts (+ how many hosts are hidden behind mDNS names)
+const cands = sdp => { const c = { host: 0, srflx: 0, relay: 0, mdns: 0 }; for (const m of (sdp || '').matchAll(/a=candidate:\S+ \d+ \w+ \d+ (\S+) \d+ typ (\w+)/g)) { if (m[2] in c) c[m[2]]++; if (/\.local$/.test(m[1])) c.mdns++; } return c; };
+const candStr = c => `host:${c.host}${c.mdns ? '(mdns ' + c.mdns + ')' : ''} srflx:${c.srflx} relay:${c.relay}`;
 const QS = new URLSearchParams(location.search);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rid = () => Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
@@ -83,11 +86,12 @@ async function sig(body) {
 }
 const waitIce = (pc, ms = 4500) => new Promise(res => {
   if (pc.iceGatheringState === 'complete') return res();
-  let relay = false, srflx = false;
+  let relay = false, srflx = false, any = false;
   const t = setTimeout(res, ms);
   const soon = d => { clearTimeout(t); setTimeout(res, d); };
+  setTimeout(() => { if (!any) { clearTimeout(t); res(); } }, 2000);   // nothing at all: WebRTC is blocked, don't wait
   pc.addEventListener('icecandidate', e => {
-    const c = e.candidate && e.candidate.candidate || '';
+    const c = e.candidate && e.candidate.candidate || ''; if (c) any = true;
     if (/ typ relay/.test(c) && !relay) { relay = true; soon(400); }
     else if (/ typ srflx/.test(c) && !srflx && !relay) { srflx = true; setTimeout(() => { if (!relay) res(); }, 2500); }
   });
@@ -97,13 +101,25 @@ const NETLOG = [];
 const nlog = (...a) => { const l = new Date().toISOString().slice(11, 19) + ' ' + a.join(' '); NETLOG.push(l); if (NETLOG.length > 80) NETLOG.shift(); if (/[?&]netdebug/.test(location.search)) console.log('[net]', l); };
 class RtcConn extends Emitter {
   constructor(peerId, pc) {
-    super(); this.peer = peerId; this.pc = pc; this.open = false; this.dc = null; this.closed = false;
+    super(); this.peer = peerId; this.pc = pc; this.open = false; this.dc = null; this.closed = false; this.relay = null; this.fallback = null;
     pc.addEventListener('connectionstatechange', () => {
+      if (this.relay) return;
       const st = pc.connectionState; nlog('pc', peerId.slice(-6), st);
       if (st === 'connecting') this.emit('stage', 'ice');
+      if (st === 'failed' && this.fallback && !this.open) { const f = this.fallback; this.fallback = null; f(); return; }
       if (st === 'failed' || st === 'closed') this._end(st === 'failed');
     });
-    pc.addEventListener('iceconnectionstatechange', () => nlog('ice', peerId.slice(-6), pc.iceConnectionState));
+    pc.addEventListener('iceconnectionstatechange', () => { if (!this.relay) nlog('ice', peerId.slice(-6), pc.iceConnectionState); });
+  }
+  // switch this connection over to the MQTT relay (same object, so whoever listens to it doesn't notice)
+  useRelay(rc) {
+    if (this.closed || this.relay) return;
+    this.relay = rc; this.fallback = null;
+    if (this.dc) { this.dc.onopen = this.dc.onmessage = this.dc.onclose = null; try { this.dc.close(); } catch (e) { } }
+    try { this.pc.close(); } catch (e) { }
+    rc.on('data', d => this.emit('data', d)); rc.on('close', () => this._end(false));
+    nlog('relay in use', this.peer.slice(-6));
+    if (!this.open) { this.open = true; this.emit('open'); }
   }
   _bind(dc) {
     this.dc = dc;
@@ -113,10 +129,11 @@ class RtcConn extends Emitter {
     dc.onclose = () => this._end(false);
     if (dc.readyState === 'open') setTimeout(opened, 0);
   }
-  send(d) { if (this.dc && this.dc.readyState === 'open') this.dc.send(JSON.stringify(d)); }
+  send(d) { if (this.relay) { this.relay.send(d); return; } if (this.dc && this.dc.readyState === 'open') this.dc.send(JSON.stringify(d)); }
   close() { this._end(false); }
   _end(failed) {
     if (this.closed) return; this.closed = true; const was = this.open; this.open = false;
+    if (this.relay) try { this.relay.close(); } catch (e) { }
     try { if (this.dc) this.dc.close(); } catch (e) { } try { this.pc.close(); } catch (e) { }
     if (failed && !was) this.emit('error', { type: 'webrtc' });
     this.emit('close');
@@ -297,11 +314,16 @@ class MqttBus extends Emitter {
     set.add(fn);
     return () => { set.delete(fn); if (!set.size && this.subs.get(topic) === set) { this.subs.delete(topic); this.clients.forEach(c => c.unsub(topic)); } };
   }
-  pub(topic, obj) {
-    const s = JSON.stringify(Object.assign({}, obj, { m: rid() })); let n = 0;
-    for (const c of this.clients) if (c.ok) { c.pub(topic, s); n++; }
-    return n;
+  pub(topic, obj) { return this.pubOn(null, topic, obj); }
+  // publish only via the given brokers (falls back to every live one if none of them is up)
+  pubOn(urls, topic, obj) {
+    const s = JSON.stringify(Object.assign({}, obj, { m: rid() }));
+    let live = this.clients.filter(c => c.ok && (!urls || urls.includes(c.url)));
+    if (!live.length) live = this.clients.filter(c => c.ok);
+    for (const c of live) c.pub(topic, s);
+    return live.length;
   }
+  liveUrls() { return this.clients.filter(c => c.ok).sort((a, b) => a.ms - b.ms).map(c => c.url); }
   _msg(topic, s) {
     let o; try { o = JSON.parse(s); } catch (e) { return; }
     if (!o || typeof o.m !== 'string' || this.seen.has(o.m)) return;
@@ -314,9 +336,20 @@ const brokerList = () => { const q = QS.get('mqtt'); return q ? q.split(',').map
 const bus = () => BUS || (BUS = new MqttBus(brokerList()));
 const iceList = () => (NL.info && NL.info.iceServers) || (NL.ice && NL.ice.iceServers) || DEFAULT_ICE;
 const T = (room, ...p) => TOPIC + room + '/' + p.join('/');
+// game traffic through the brokers themselves, for when a direct WebRTC channel can't be made
+// (VPN/antivirus blocking WebRTC, UDP closed, strict NAT). Slower than direct, but works wherever MQTT does.
+class RelayConn extends Emitter {
+  constructor(bus, out, from, peerId, brokers) { super(); this.bus = bus; this.out = out; this.from = from; this.peer = peerId; this.brokers = brokers; this.open = false; this.closed = false; this.isRelay = true; }
+  _open() { if (this.open || this.closed) return; this.open = true; nlog('relay open', this.peer.slice(-6), (this.brokers || []).map(u => u.replace(/^wss?:\/\//, '').replace(/[:/].*$/, '')).join(',')); this.emit('open'); }
+  _in(d) { if (!this.closed) this.emit('data', d); }
+  send(d) { if (this.open) this.bus.pubOn(this.brokers, this.out, { t: 'rd', from: this.from, d }); }
+  close() { if (this.closed) return; this.closed = true; this.open = false; this.bus.pubOn(this.brokers, this.out, { t: 'rbye', from: this.from }); this.emit('close'); }
+  _gone() { if (this.closed) return; this.closed = true; this.open = false; this.emit('close'); }
+}
+const RELAY_AFTER = 6000;   // ms after the host's answer without a direct channel -> use the relay
 class MqttPeer extends Emitter {
   constructor(id) {
-    super(); this.destroyed = false; this.conns = new Map(); this.offs = []; this.ice = iceList(); this.bus = bus();
+    super(); this.destroyed = false; this.conns = new Map(); this.relays = new Map(); this.offs = []; this.ice = iceList(); this.bus = bus();
     if (id) { this.id = id; this.room = id.slice(PREFIX.length); this.isHost = true; }
     else { this.id = 'q' + rid(); this.isHost = false; }
     this.bus.ready().then(() => {
@@ -330,6 +363,21 @@ class MqttPeer extends Emitter {
     if (this.destroyed || typeof m.from !== 'string' || m.from.length > 40) return;
     const reply = o => this.bus.pub(T(this.room, 'g', m.from), Object.assign({ from: this.id }, o));
     if (m.t === 'knock') { reply({ t: 'here' }); return; }
+    if (m.t === 'rd') { const rc = this.relays.get(m.from); if (rc) rc._in(m.d); return; }
+    if (m.t === 'rbye') { const rc = this.relays.get(m.from); if (rc) rc._gone(); return; }
+    if (m.t === 'relay') {
+      let rc = this.relays.get(m.from);
+      if (!rc || rc.closed) {
+        const old = this.conns.get(m.from); if (old) { old.fallback = null; old.close(); }
+        const theirs = Array.isArray(m.b) ? m.b : [], mine = this.bus.liveUrls();
+        let use = mine.filter(u => theirs.includes(u)).slice(0, 2); if (!use.length) use = mine.slice(0, 2);
+        rc = new RelayConn(this.bus, T(this.room, 'g', m.from), this.id, m.from, use); this.relays.set(m.from, rc);
+        rc.on('close', () => { if (this.relays.get(m.from) === rc) this.relays.delete(m.from); });
+        nlog('relay requested by', m.from.slice(-6), m.why || '');
+        this.emit('connection', rc); rc._open();
+      }
+      reply({ t: 'relay-ok', b: rc.brokers }); return;
+    }
     if (m.t === 'offer' && typeof m.sdp === 'string') {
       const old = this.conns.get(m.from);
       if (old && !old.closed) { if (old._answer) reply({ t: 'answer', sdp: old._answer }); return; }
@@ -337,7 +385,8 @@ class MqttPeer extends Emitter {
     }
   }
   async _onOffer(m, reply) {
-    nlog('mqtt offer from', m.from.slice(-6));
+    if (this.relays.has(m.from)) return;
+    nlog('mqtt offer from', m.from.slice(-6), candStr(cands(m.sdp)));
     const pc = new RTCPeerConnection({ iceServers: this.ice });
     const conn = new RtcConn(m.from, pc); this.conns.set(m.from, conn);
     conn.on('close', () => { if (this.conns.get(m.from) === conn) this.conns.delete(m.from); });
@@ -348,39 +397,49 @@ class MqttPeer extends Emitter {
     await waitIce(pc);
     if (conn.closed || this.destroyed) return;
     conn._answer = pc.localDescription.sdp; reply({ t: 'answer', sdp: conn._answer });
-    nlog('mqtt answer sent', m.from.slice(-6));
+    nlog('mqtt answer sent', m.from.slice(-6), candStr(cands(conn._answer)));
   }
   connect(peerId) {
     const room = peerId.slice(PREFIX.length);
     const pc = new RTCPeerConnection({ iceServers: this.ice });
     const conn = new RtcConn(peerId, pc); this.conns.set(peerId, conn);
     conn._bind(pc.createDataChannel('game', { ordered: true }));
-    let here = false, answered = false, sdp = null;
+    let here = false, answered = 0, sdp = null, relayAsked = 0, rc = null, why = '';
+    const askRelay = w => { if (rc || conn.closed || conn.open) return; if (!relayAsked) { why = w; nlog('direct link failed (' + w + '), asking for relay'); conn.emit('stage', 'relay'); } relayAsked = Date.now(); this.bus.pub(T(room, 'h'), { t: 'relay', from: this.id, b: this.bus.liveUrls(), why }); };
+    conn.fallback = () => askRelay('ice failed');
     this.offs.push(this.bus.sub(T(room, 'g', this.id), async m => {
+      if (m.t === 'rd') { if (rc) rc._in(m.d); return; }
+      if (m.t === 'rbye') { if (rc) rc._gone(); return; }
       if (m.t === 'here' && !here) { here = true; nlog('mqtt host found'); conn.emit('stage', 'room'); }
-      if (m.t === 'answer' && typeof m.sdp === 'string' && !answered && !conn.closed) {
-        answered = true; nlog('mqtt answer received'); conn.emit('stage', 'answer');
-        try { await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }); } catch (e) { nlog('mqtt answer err', e.message); }
+      if (m.t === 'relay-ok' && relayAsked && !rc && !conn.closed) { rc = new RelayConn(this.bus, T(room, 'h'), this.id, peerId, Array.isArray(m.b) ? m.b : null); rc._open(); conn.useRelay(rc); }
+      if (m.t === 'answer' && typeof m.sdp === 'string' && !answered && !conn.closed && !relayAsked) {
+        answered = Date.now(); const ac = cands(m.sdp); nlog('mqtt answer received', candStr(ac)); conn.emit('stage', 'answer');
+        if (!ac.host && !ac.srflx && !ac.relay) { askRelay('host has no ICE candidates'); return; }
+        try { await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }); } catch (e) { nlog('mqtt answer err', e.message); askRelay('bad answer'); }
       }
     }));
     (async () => {
       await pc.setLocalDescription(await pc.createOffer()); await waitIce(pc);
-      sdp = pc.localDescription.sdp; nlog('mqtt offer ready', 'relay:' + / typ relay/.test(sdp), 'srflx:' + / typ srflx/.test(sdp));
-    })().catch(e => nlog('mqtt offer err', e && e.message));
+      sdp = pc.localDescription.sdp; nlog('mqtt offer ready', candStr(cands(sdp)));
+    })().catch(e => { nlog('mqtt offer err', e && e.message); sdp = ''; });
     (async () => {
       const t0 = Date.now(); let lastOffer = 0, lastKnock = 0;
-      while (!conn.closed && !answered && !this.destroyed) {
+      while (!conn.open && !conn.closed && !this.destroyed) {
+        const now = Date.now();
         if (!here) {
-          if (Date.now() - lastKnock > 1500) { this.bus.pub(T(room, 'h'), { t: 'knock', from: this.id }); lastKnock = Date.now(); }
-          if (Date.now() - t0 > 14000) { nlog('mqtt: nobody answered the knock'); this.emit('error', { type: 'peer-unavailable' }); return; }
-        } else if (sdp && Date.now() - lastOffer > 3500) { this.bus.pub(T(room, 'h'), { t: 'offer', from: this.id, sdp }); lastOffer = Date.now(); conn.emit('stage', 'offer'); }
-        await sleep(300);
+          if (now - lastKnock > 1500) { this.bus.pub(T(room, 'h'), { t: 'knock', from: this.id }); lastKnock = now; }
+          if (now - t0 > 14000) { nlog('mqtt: nobody answered the knock'); this.emit('error', { type: 'peer-unavailable' }); return; }
+        } else if (relayAsked) { if (now - relayAsked > 2500) askRelay(why); }
+        else if (sdp === '' || (sdp && !/a=candidate/.test(sdp))) askRelay('no ICE candidates (WebRTC blocked?)');
+        else if (answered) { if (now - answered > RELAY_AFTER) askRelay('no direct link in ' + RELAY_AFTER / 1000 + 's'); }
+        else if (sdp && now - lastOffer > 3500) { this.bus.pub(T(room, 'h'), { t: 'offer', from: this.id, sdp }); lastOffer = now; conn.emit('stage', 'offer'); }
+        await sleep(250);
       }
     })().catch(e => { nlog('mqtt connect err', e && e.message); this.emit('error', { type: 'network', message: e && e.message }); });
     return conn;
   }
   reconnect() { }
-  destroy() { if (this.destroyed) return; this.destroyed = true; this.offs.forEach(f => f()); this.offs = []; for (const c of [...this.conns.values()]) c.close(); }
+  destroy() { if (this.destroyed) return; this.destroyed = true; for (const c of [...this.conns.values(), ...this.relays.values()]) c.close(); this.offs.forEach(f => f()); this.offs = []; }
 }
 
 // ---------------------------------------------------------------- PeerJS (CDN) + static ice.json
@@ -438,6 +497,7 @@ export function routesInfo() {
   return {
     routes: NET._routes || [], mqttUp: BUS ? BUS.up : 0, mqttTotal: brokerList().length,
     listening: NET.hosts.map(p => p.tr), via: NET.role === 'client' ? NET.backend : null, role: NET.role,
+    relay: NET.role === 'client' ? !!(NET.hostConn && (NET.hostConn.relay || NET.hostConn.isRelay)) : [...NET.conns.values()].filter(c => c.relay || c.isRelay).length,
     turn: NL.info ? NL.info.turnKind : NL.ice ? (NL.ice.turnKind === 'own' ? 'own' : 'none') : 'public',
   };
 }
@@ -456,8 +516,8 @@ const errText = (e, code) => {
 };
 const newCode = () => Array.from({ length: 4 }, () => ALPHA[Math.floor(Math.random() * ALPHA.length)]).join('');
 const KIND_RANK = { nat: 5, host: 4, missing: 3, net: 2, load: 1, gone: 0 };
-const STAGES = { room: 'Дача найдена, отправляем приглашение…', offer: 'Ждём ответа хозяина…', answer: 'Хозяин ответил, соединяемся…', ice: 'Пробиваем соединение через сеть…' };
-const STAGE_RANK = { start: 0, room: 1, offer: 2, answer: 3, ice: 4 };
+const STAGES = { room: 'Дача найдена, отправляем приглашение…', offer: 'Ждём ответа хозяина…', answer: 'Хозяин ответил, соединяемся…', ice: 'Пробиваем соединение через сеть…', relay: 'Напрямую не пробилось, подключаемся через ретранслятор…' };
+const STAGE_RANK = { start: 0, room: 1, offer: 2, answer: 3, ice: 4, relay: 5 };
 // PeerJS doesn't report handshake progress, so read it off its RTCPeerConnection
 function watchPeerjs(conn) {
   try {
@@ -516,7 +576,7 @@ export const NET = {
       if (this.conns.size >= MAX_PLAYERS - 1) { try { conn.send({ t: 'full' }); } catch (e) { } setTimeout(() => conn.close(), 400); return; }
       const used = new Set([...this.conns.values()].map(c => c._pid));
       for (let i = 1; i < MAX_PLAYERS; i++) if (!used.has('p' + i)) { pid = 'p' + i; break; }
-      conn._pid = pid; conn._seen = performance.now(); this.conns.set(pid, conn); nlog('guest', pid, 'via', tr);
+      conn._pid = pid; conn._seen = performance.now(); this.conns.set(pid, conn); nlog('guest', pid, 'via', tr + (conn.isRelay ? ' relay' : ''));
     });
     conn.on('data', d => {
       if (!pid) return; conn._seen = performance.now();
@@ -562,7 +622,8 @@ export const NET = {
       };
       peer.on('error', e => fail(e));
       to = setTimeout(() => {
-        if (stage === 'answer' || stage === 'ice') fail({ message: `Хозяин ответил, но соединение не пробилось через сеть. Обычно это строгий NAT или файрвол: подключите свой TURN-сервер (см. README) или попробуйте другую сеть (например, мобильный интернет).` }, 'nat');
+        if (stage === 'relay') fail({ message: `Хозяин найден, но не удалось подключиться ни напрямую, ни через ретранслятор. Нажми «Журнал связи» и пришли его.` }, 'nat');
+        else if (stage === 'answer' || stage === 'ice') fail({ message: `Хозяин ответил, но соединение не пробилось через сеть. Обычно это строгий NAT или файрвол: подключите свой TURN-сервер (см. README) или попробуйте другую сеть (например, мобильный интернет).` }, 'nat');
         else if (stage === 'offer' || stage === 'room') fail({ message: `Дача ${code} есть, но хозяин не отвечает. Вкладка хозяина должна быть открыта (не закрыта и не в спящем режиме).` }, 'host');
         else fail({ message: `Не достучаться до дачи ${code}. Проверь код и что хозяин ещё ждёт. Если не помогает, нажми «Проверить сеть».` }, 'missing');
       }, timeout);
@@ -577,7 +638,7 @@ export const NET = {
           if (ctx.won) { att.cancel(); return; }
           ctx.won = true; done = true; clearTimeout(to); ctx.attempts.forEach(a => { if (a !== att) a.cancel(); });
           this.peer = peer; this.hostConn = conn; this.role = 'client'; this.code = code; this.backend = tr; conn._seen = performance.now();
-          nlog('joined via', tr);
+          nlog('joined via', tr + (conn.relay ? ' relay' : ''));
           conn.send(Object.assign({ t: 'hello' }, hello)); res(code);
         });
         conn.on('data', d => { conn._seen = performance.now(); this.handlers.data('h', d); });
@@ -615,11 +676,11 @@ export const NET = {
 // ---------------------------------------------------------------- "Проверить сеть": what works from this browser
 function gather(iceServers, ms) {
   return new Promise(res => {
-    const types = new Set(); let pc, t = null;
-    const end = () => { clearTimeout(t); try { pc.close(); } catch (e) { } res(types); };
-    try { pc = new RTCPeerConnection({ iceServers }); } catch (e) { res(types); return; }
+    const c = { host: 0, srflx: 0, relay: 0, mdns: 0, ms: 0 }; const t0 = performance.now(); let pc, t = null;
+    const end = () => { clearTimeout(t); c.ms = Math.round(performance.now() - t0); try { pc.close(); } catch (e) { } res(c); };
+    try { pc = new RTCPeerConnection({ iceServers }); } catch (e) { res(c); return; }
     t = setTimeout(end, ms);
-    pc.onicecandidate = e => { if (!e.candidate) { end(); return; } const m = / typ (\w+)/.exec(e.candidate.candidate); if (m) types.add(m[1]); };
+    pc.onicecandidate = e => { if (!e.candidate) { end(); return; } const m = / (\S+) \d+ typ (\w+)/.exec(e.candidate.candidate); if (m) { if (m[2] in c) c[m[2]]++; if (/\.local$/.test(m[1])) c.mdns++; } };
     pc.createDataChannel('probe');
     pc.createOffer().then(o => pc.setLocalDescription(o)).catch(end);
   });
@@ -649,17 +710,20 @@ export async function netCheck(show) {
   })());
   if (rs.includes('netlify')) put(3, 'Свой сервер на Netlify: ✓');
   jobs.push((async () => {
-    const ty = await gather(iceList(), 7000);
-    put(4, `Внешний адрес (STUN): ${ty.has('srflx') ? '✓' : '✗ (UDP, похоже, закрыт)'}`);
-    put(5, `Ретранслятор (TURN): ${ty.has('relay') ? '✓' : '✗ (если друг в другой сети, может не пробиться)'}`);
-    return { srflx: ty.has('srflx'), relay: ty.has('relay') };
+    const c = await gather(iceList(), 7000);
+    nlog('ice gather', candStr(c), c.ms + 'ms');
+    put(4, c.host + c.srflx + c.relay === 0 ? 'WebRTC: браузер не выдал ни одного адреса ✗ (его зажимает VPN-расширение, антивирус или настройка «защита от утечки WebRTC»)' : `Свой адрес (WebRTC): ${c.host} ✓`);
+    put(5, `Внешний адрес (STUN): ${c.srflx ? '✓' : '✗ (UDP наружу, похоже, закрыт)'}`);
+    put(6, `Ретранслятор TURN: ${c.relay ? '✓' : '✗'}`);
+    return { host: c.host, srflx: !!c.srflx, relay: !!c.relay };
   })());
   const r = Object.assign({}, ...(await Promise.all(jobs)));
   const sig = r.mqtt || r.peerjs || rs.includes('netlify') || rs.includes('local');
   put(0, null);
-  put(6, !sig ? '➜ Нет связи ни с одним сервером знакомств. Похоже, их режет провайдер или фильтр: попробуй VPN или другую сеть (например, мобильный интернет).'
-    : !r.srflx && !r.relay ? '➜ Серверы знакомств доступны, но UDP закрыт. На одном компьютере и в одной Wi-Fi сети играть можно, через интернет вряд ли.'
-    : !r.relay ? '➜ Основное работает. Если друг в другой сети и не подключается, нужен свой TURN (ice.json, см. README).'
+  put(7, !sig ? '➜ Нет связи ни с одним сервером знакомств. Похоже, их режет провайдер или фильтр: попробуй VPN или другую сеть (например, мобильный интернет).'
+    : !r.host && !r.srflx && !r.relay ? (r.mqtt ? '➜ WebRTC в этом браузере зажат, так что игра пойдёт через ретранслятор MQTT (задержка чуть больше). Для прямой связи выключи VPN-расширение / защиту WebRTC для этого сайта.' : '➜ WebRTC зажат, а MQTT недоступен: выключи VPN-расширение / защиту WebRTC или попробуй другую сеть.')
+    : !r.srflx && !r.relay ? '➜ Через интернет напрямую вряд ли пробьётся (UDP закрыт), но в одной сети может. Если нет, игра сама перейдёт на ретранслятор MQTT.'
+    : !r.relay ? '➜ Основное работает. Если напрямую не пробьётся, игра переключится на ретранслятор MQTT.'
     : '➜ Всё работает ✓ Если всё равно не подключается, нажми «Журнал связи» и пришли его.');
   nlog('check result', JSON.stringify(r));
   return r;

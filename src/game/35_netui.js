@@ -13,8 +13,8 @@ const RN = { mqtt: 'MQTT', peerjs: 'PeerJS', netlify: 'Netlify', local: 'лок�
 function routesText() {
   const r = routesInfo();
   const name = tr => tr === 'mqtt' ? `MQTT (${r.mqttUp}/${r.mqttTotal})` : RN[tr] || tr;
-  if (r.role === 'host') return `Дача слушает: ${r.listening.map(name).join(', ') || '…'}`;
-  if (r.role === 'client') return `Подключено через ${RN[r.via] || r.via}`;
+  if (r.role === 'host') return `Дача слушает: ${r.listening.map(name).join(', ') || '…'}${r.relay ? ` · через ретранслятор: ${r.relay}` : ''}`;
+  if (r.role === 'client') return r.relay ? 'Подключено через ретранслятор MQTT (напрямую не пробилось)' : `Подключено напрямую (знакомство через ${RN[r.via] || r.via})`;
   if (!r.routes.length) return '';
   const turn = { own: 'свой TURN ✓', public: 'общий бесплатный TURN', none: 'без TURN' }[r.turn] || '';
   return `Связь: ${r.routes.map(tr => RN[tr] || tr).join(' + ')} (что быстрее)${turn && !r.routes.includes('local') ? ' · ' + turn : ''}`;
